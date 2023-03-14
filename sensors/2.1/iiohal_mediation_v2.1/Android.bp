@@ -14,7 +14,7 @@
 // limitations under the License.
 
 cc_library_static {
-    name: "intel.android.iiod.client@2.0-impel",
+    name: "intel.android.iiod.client@2.1-impel",
     defaults: ["hidl_defaults"],
     vendor: true,
     local_include_dirs: [".", "libiio_client"],
@@ -53,7 +53,7 @@ cc_library_static {
         "libxml2",
     ],
     cflags: [
-        "-DLOG_TAG=\"SensorsHal2.0\"",
+        "-DLOG_TAG=\"SensorsHal2.1\"",
         "-Wall",
         "-Wno-unused-variable",
         "-Wno-unused-parameter",

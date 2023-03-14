@@ -30,7 +30,7 @@ iioClient *iioClient::iioc = NULL;
  * name@sensor_map should be matched with iio sensor name and returns sensor-id.
  * Where stuct iio_sensor_map -> {name, id};
  */
-struct iio_sensor_map sensor_map[10] = {
+struct iio_sensor_map sensor_map[11] = {
     {"unknown", 0},
     {"accel_3d", 1},
     {"gyro_3d", 2},
@@ -41,6 +41,7 @@ struct iio_sensor_map sensor_map[10] = {
     {"geomagnetic_orientation", 7},
     {"relative_orientation", 8},
     {"incli_3d", 9},
+    {"hinge", 10},
 };
 
 /**
@@ -104,9 +105,10 @@ void iioClient::iioThread(struct iioclient_device *devlist) {
                     if (strcmp(devlist[id].name, "magn_3d") == 0)
                         devlist[id].data[index] = strtof(buf, NULL) * devlist[id].scale * 100;
                     else if (strcmp(devlist[id].name, "accel_3d") == 0)
-                        devlist[id].data[index] = strtof(buf, NULL) * devlist[id].scale * -1;
-                    else if (strcmp(devlist[id].name, "dev_rotation") == 0)
-                        devlist[id].data[index] = strtof(buf, NULL) * devlist[id].scale * -1;
+			if (property_get_bool("vendor.intel.accel_3d.reverse_scale", true)){
+                        	devlist[id].data[index] = strtof(buf, NULL) * devlist[id].scale * -1;}
+			else {
+                        	devlist[id].data[index] = strtof(buf, NULL) * devlist[id].scale;}
                     else
                         devlist[id].data[index] = strtof(buf, NULL) * devlist[id].scale;
 		}
@@ -191,7 +193,7 @@ bool iioClient::iioInit(void) {
 
         bool scale_found = false;
         unsigned int nb_channels = iio_device_get_channels_count(device);
-        /* Skip device with no channles */
+        /* Skip device with no channels */
         if (!nb_channels)
             continue;
 

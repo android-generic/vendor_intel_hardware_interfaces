@@ -29,19 +29,20 @@ senPlugin_cc_defaults {
 }
 
 cc_binary {
-    name: "android.hardware.sensors@2.0-service.intel",
+    name: "android.hardware.sensors@2.1-service.intel",
     defaults: ["hidl_defaults", "senPlugin_defaults"],
     vendor: true,
     relative_install_path: "hw",
 
     local_include_dirs: [
-        "iiohal_mediation_v2.0",
-        "iiohal_mediation_v2.0/libiio_client"
+        "iiohal_mediation_v2.1",
+        "iiohal_mediation_v2.1/libiio_client"
     ],
     srcs: [
+        "SensorsV2_1.cpp",
         "service.cpp",
     ],
-    init_rc: ["android.hardware.sensors@2.0-service-intel.rc"],
+    init_rc: ["android.hardware.sensors@2.1-service-intel.rc"],
     header_libs: [
         "android.hardware.sensors@2.X-shared-utils",
     ],
@@ -61,7 +62,7 @@ cc_binary {
     ],
     static_libs: [
         "android.hardware.sensors@1.0-convert",
-        "intel.android.iiod.client@2.0-impel"
+        "intel.android.iiod.client@2.1-impel"
     ],
-    vintf_fragments: ["android.hardware.sensors@2.0.xml"],
+//    vintf_fragments: ["android.hardware.sensors@2.1.xml"],
 }

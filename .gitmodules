@@ -2,3 +2,7 @@
 	path = sensors/2.0/iiohal_mediation_v2.0/libiio_client
 	url = https://github.com/supremegamers/libiio_client
 	branch = libiio_client
+[submodule "sensors/2.1/iiohal_mediation_v2.1/libiio_client"]
+	path = sensors/2.1/iiohal_mediation_v2.1/libiio_client
+	url = https://github.com/supremegamers/libiio_client
+	branch = libiio_client

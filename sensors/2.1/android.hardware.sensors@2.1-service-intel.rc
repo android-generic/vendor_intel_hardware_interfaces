@@ -1,7 +1,9 @@
-service vendor.sensors-hal-2-0-intel /vendor/bin/hw/android.hardware.sensors@2.0-service.intel
+service vendor.sensors-hal-2-1-intel /vendor/bin/hw/android.hardware.sensors@2.1-service.intel
     interface android.hardware.sensors@2.0::ISensors default
+    interface android.hardware.sensors@2.1::ISensors default
     class hal
     user system
     group system wakelock uhid context_hub
     capabilities BLOCK_SUSPEND
     rlimit rtprio 10 10
+    disabled

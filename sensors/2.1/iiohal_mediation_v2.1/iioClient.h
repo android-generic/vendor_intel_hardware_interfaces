@@ -15,8 +15,8 @@
  *
  */
 
-#ifndef SENSORS_2_0_IIOHAL_MEDIATION_V2_0_IIO_CLIENT_H_
-#define SENSORS_2_0_IIOHAL_MEDIATION_V2_0_IIO_CLIENT_H_
+#ifndef SENSORS_2_1_IIOHAL_MEDIATION_V2_1_IIO_CLIENT_H_
+#define SENSORS_2_1_IIOHAL_MEDIATION_V2_1_IIO_CLIENT_H_
 
 #include <errno.h>
 #include <getopt.h>
@@ -39,7 +39,7 @@
 
 #include "iio.h"
 
-#define MAX_SENSOR 9
+#define MAX_SENSOR 10
 #define MAX_CHANNEL 3
 #define SENSOR_PORT "30431"
 #define USE_LOCAL_CONTEXT
@@ -112,4 +112,4 @@ class iioClient {
     int activate(int handle, bool enabled);
     int batch(int handle, int32_t sampling_period_ns);
 };
-#endif  /*SENSORS_2_0_IIOHAL_MEDIATION_V2_0_IIO_CLIENT_H_*/
+#endif  /*SENSORS_2_1_IIOHAL_MEDIATION_V2_1_IIO_CLIENT_H_*/
