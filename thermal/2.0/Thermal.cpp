@@ -16,6 +16,8 @@
 
 #include <cmath>
 #include <set>
+#include <array>
+#include <string>
 
 #include <android-base/logging.h>
 #include <hidl/HidlTransportSupport.h>
@@ -45,22 +47,15 @@ using ::android::hardware::interfacesEqual;
 using ::android::hardware::thermal::V1_0::ThermalStatus;
 using ::android::hardware::thermal::V1_0::ThermalStatusCode;
 
-static const char *CPU_LABEL[] = {"CPU0",
-                                  "CPU1",
-                                  "CPU2",
-                                  "CPU3",
-                                  "CPU4",
-                                  "CPU5",
-                                  "CPU6",
-                                  "CPU7",
-                                  "CPU8",
-                                  "CPU9",
-                                  "CPU10",
-                                  "CPU11",
-                                  "CPU12",
-                                  "CPU13",
-                                  "CPU14",
-                                  "CPU15"};
+static const int CPU_COUNT = 64;
+static const std::array<const char*, CPU_COUNT> CPU_LABEL = [] {
+    std::array<const char*, CPU_COUNT> labels{};
+    for (int i = 0; i < CPU_COUNT; ++i) {
+        labels[i] = ("CPU" + std::to_string(i)).c_str();
+    }
+    return labels;
+}();
+
 struct zone_info {
 	uint32_t temperature;
 	uint32_t trip_0;
