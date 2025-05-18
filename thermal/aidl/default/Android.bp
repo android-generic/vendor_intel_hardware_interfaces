@@ -67,7 +67,6 @@ apex {
         "android.hardware.thermal@aidl-service.intel",
     ],
     prebuilts: [
-        "android.hardware.thermal.intel.xml",
         "android.hardware.thermal.intel.rc",
     ],
 }

@@ -2,4 +2,4 @@ service vendor.thermal-aidl-intel /apex/com.android.hardware.thermal.intel/bin/h
     class hal
     user nobody
     group system
-
+    disabled
