@@ -32,12 +32,12 @@
 #include <map>
 #include <system_error>
 #include <charconv>
+#include <algorithm>
+#include <mutex>
+#include <unistd.h>
+#include <vector>
+#include <string>
 
-#define SYSFS_TEMPERATURE_CPU       "/sys/class/thermal/thermal_zone0/temp"
-#define CPU_NUM_MAX                 Thermal::getNumCpu()
-#define CPU_USAGE_PARAS_NUM         5
-#define CPU_USAGE_FILE              "/proc/stat"
-#define CPU_ONLINE_FILE             "/sys/devices/system/cpu/online"
 #define TEMP_UNIT                   1000.0
 #define THERMAL_PORT                14096
 #define MAX_ZONES                   40
@@ -58,6 +58,38 @@ bool interfacesEqual(const std::shared_ptr<::ndk::ICInterface>& left,
 
 }  // namespace
 
+// =============================================================================
+// CPU Vendor Detection
+// =============================================================================
+enum CpuVendor { CPU_VENDOR_UNKNOWN, CPU_VENDOR_INTEL, CPU_VENDOR_AMD };
+static CpuVendor S_CPU_VENDOR = CPU_VENDOR_UNKNOWN;
+
+static CpuVendor detect_cpu_vendor() {
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    if (!cpuinfo.is_open()) {
+        ALOGE("Failed to open /proc/cpuinfo for vendor detection");
+        return CPU_VENDOR_UNKNOWN;
+    }
+    std::string line;
+    while (std::getline(cpuinfo, line)) {
+        if (line.find("vendor_id") != std::string::npos) {
+            if (line.find("GenuineIntel") != std::string::npos) {
+                ALOGI("Detected CPU vendor: Intel");
+                return CPU_VENDOR_INTEL;
+            }
+            if (line.find("AuthenticAMD") != std::string::npos) {
+                ALOGI("Detected CPU vendor: AMD");
+                return CPU_VENDOR_AMD;
+            }
+        }
+    }
+    ALOGW("Unknown CPU vendor");
+    return CPU_VENDOR_UNKNOWN;
+}
+
+// =============================================================================
+// Constants and Globals
+// =============================================================================
 static const char *THROTTLING_SEVERITY_LABEL[] = {
                                                   "NONE",
                                                   "LIGHT",
@@ -89,13 +121,22 @@ struct temp_info {
     uint32_t temp;
 };
 
-Temperature kTemp_1_0,kTemp_2_0;
+// Temperature and threshold globals.
+// Initialized with safe defaults; updated by check thread and VSOCK path.
+Temperature kTemp_2_0;
 TemperatureThreshold kTempThreshold;
 
+// =============================================================================
+// Thread-Safety: Mutex for temperature/threshold globals
+// =============================================================================
+// Protects: kTemp_2_0, kTempThreshold
+static std::mutex s_temp_data_mutex;
 
+// =============================================================================
+// VSOCK Communication (kept per user request)
+// =============================================================================
 static void parse_temp_info(struct temp_info *t)
 {
-    int temp = t->temp / TEMP_UNIT;
     switch(t->type) {
         case 0:
             kTemp_2_0.value = t->temp / TEMP_UNIT;
@@ -107,13 +148,11 @@ static void parse_temp_info(struct temp_info *t)
 
 static void parse_zone_info(struct zone_info *zone)
 {
-    int temp = zone->temperature;
-    kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 99, 108}};
          switch (zone->type) {
               case 0:
                     kTempThreshold.hotThrottlingThresholds[5] = zone->trip_0 / TEMP_UNIT;
                     kTempThreshold.hotThrottlingThresholds[6] = zone->trip_1 / TEMP_UNIT;
-                    kTemp_2_0.value = zone->temperature / TEMP_UNIT;;
+                    kTemp_2_0.value = zone->temperature / TEMP_UNIT;
                     break;
               default:
                     break;
@@ -197,22 +236,175 @@ static int recv_vsock(int *vsock_fd)
     return 0;
 }
 
-static int get_soc_pkg_temperature(float* temp)
+// =============================================================================
+// Smart Thermal Zone Discovery (replaces hardcoded thermal_zone0)
+// =============================================================================
+static std::string discover_cpu_thermal_zone(bool enable_logging) {
+    const std::string thermal_base = "/sys/class/thermal/";
+
+    struct ZoneTypePriority {
+        std::string type_name;
+        int priority;
+    };
+    static const std::vector<ZoneTypePriority> known_cpu_zones = {
+        {"x86_pkg_temp", 1},    // Intel package temperature
+        {"k10temp",      2},    // AMD k10temp
+        {"acpitz",       10},   // ACPI thermal zone (generic fallback)
+    };
+
+    std::string best_path;
+    std::string best_type;
+    int best_priority = INT_MAX;
+
+    for (int i = 0; i < 100; i++) {
+        std::string zone_dir = thermal_base + "thermal_zone" + std::to_string(i);
+        std::string type_path = zone_dir + "/type";
+
+        std::ifstream type_file(type_path);
+        if (!type_file.is_open()) break;
+
+        std::string zone_type;
+        std::getline(type_file, zone_type);
+        type_file.close();
+
+        for (const auto& known : known_cpu_zones) {
+            if (zone_type == known.type_name && known.priority < best_priority) {
+                std::string temp_path = zone_dir + "/temp";
+                if (access(temp_path.c_str(), R_OK) == 0) {
+                    best_priority = known.priority;
+                    best_path = temp_path;
+                    best_type = zone_type;
+                    if (enable_logging) {
+                        ALOGI("Found CPU thermal zone candidate: %s (type=%s, priority=%d)",
+                              zone_dir.c_str(), zone_type.c_str(), known.priority);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!best_path.empty()) {
+        if (enable_logging) {
+            ALOGI("Selected CPU thermal zone: %s (type=%s)", best_path.c_str(), best_type.c_str());
+        }
+    } else {
+        if (enable_logging) {
+            ALOGW("No known CPU thermal zone type found via discovery.");
+        }
+    }
+
+    return best_path;
+}
+
+// =============================================================================
+// Dynamic Threshold Detection
+// =============================================================================
+
+static float read_critical_trip_from_zones() {
+    const std::string thermal_base = "/sys/class/thermal/";
+    float min_critical = NAN;
+
+    for (int z = 0; z < 100; z++) {
+        std::string zone_dir = thermal_base + "thermal_zone" + std::to_string(z);
+        std::string type_path = zone_dir + "/type";
+
+        std::ifstream type_file(type_path);
+        if (!type_file.is_open()) break;
+
+        std::string zone_type;
+        std::getline(type_file, zone_type);
+        type_file.close();
+
+        if (zone_type != "x86_pkg_temp" && zone_type != "acpitz" &&
+            zone_type != "k10temp" && zone_type != "coretemp" &&
+            zone_type.find("cpu") == std::string::npos &&
+            zone_type.find("CPU") == std::string::npos) {
+            continue;
+        }
+
+        for (int t = 0; t < 20; t++) {
+            std::string trip_type_path = zone_dir + "/trip_point_" + std::to_string(t) + "_type";
+            std::string trip_temp_path = zone_dir + "/trip_point_" + std::to_string(t) + "_temp";
+
+            std::ifstream trip_type_file(trip_type_path);
+            if (!trip_type_file.is_open()) break;
+
+            std::string trip_type;
+            std::getline(trip_type_file, trip_type);
+            trip_type_file.close();
+
+            if (trip_type == "critical") {
+                std::ifstream trip_temp_file(trip_temp_path);
+                float raw_temp;
+                if (trip_temp_file >> raw_temp) {
+                    float temp_c = raw_temp / 1000.0f;
+                    if (temp_c > 50.0f && temp_c < 200.0f) {
+                        if (isnan(min_critical) || temp_c < min_critical) {
+                            min_critical = temp_c;
+                        }
+                        ALOGI("Found critical trip point: %.1f°C in zone type=%s",
+                              temp_c, zone_type.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    return min_critical;
+}
+
+static void initialize_thermal_config() {
+    float critical_temp = read_critical_trip_from_zones();
+
+    if (!isnan(critical_temp)) {
+        float emergency = critical_temp - 10.0f;
+        float shutdown = critical_temp;
+
+        std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+        kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, emergency, shutdown}};
+        ALOGI("CPU thresholds from hardware trip points: EMERGENCY=%.1f, SHUTDOWN=%.1f",
+              emergency, shutdown);
+        return;
+    }
+
+    std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+    switch (S_CPU_VENDOR) {
+        case CPU_VENDOR_INTEL:
+            kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 99, 108}};
+            ALOGI("Using Intel default thresholds: EMERGENCY=99, SHUTDOWN=108");
+            break;
+
+        case CPU_VENDOR_AMD:
+            kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 85, 95}};
+            ALOGI("Using AMD default thresholds: EMERGENCY=85, SHUTDOWN=95");
+            break;
+
+        default:
+            kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 85, 95}};
+            ALOGI("Using conservative default thresholds: EMERGENCY=85, SHUTDOWN=95");
+            break;
+    }
+}
+
+// =============================================================================
+// Temperature Reading: Thermal Zone (parameterized path)
+// =============================================================================
+static int get_soc_pkg_temperature(float* temp, const std::string& sysfs_path)
 {
     float fTemp = 0;
     int len = 0;
     FILE *file = NULL;
 
-    file = fopen(SYSFS_TEMPERATURE_CPU, "r");
+    file = fopen(sysfs_path.c_str(), "r");
 
     if (file == NULL) {
-        ALOGE("%s: failed to open file: %s", __func__, strerror(errno));
+        ALOGE("%s: failed to open file %s: %s", __func__, sysfs_path.c_str(), strerror(errno));
         return -errno;
     }
 
     len = fscanf(file, "%f", &fTemp);
     if (len < 0) {
-        ALOGE("%s: failed to read file: %s", __func__, strerror(errno));
+        ALOGE("%s: failed to read file %s: %s", __func__, sysfs_path.c_str(), strerror(errno));
         fclose(file);
         return -errno;
     }
@@ -223,10 +415,12 @@ static int get_soc_pkg_temperature(float* temp)
     return 0;
 }
 
-// --- Constants ---
+// =============================================================================
+// Temperature Reading: hwmon (coretemp + k10temp + zenpower)
+// =============================================================================
+
 const float TEMP_UNIT_DIVISOR = 1000.0f;
 
-// --- Structures: CoreTemperature and AllCpuTemperatures ---
 struct CoreTemperature {
     int id = -1;
     std::string label;
@@ -261,7 +455,6 @@ struct AllCpuTemperatures {
     }
 };
 
-// --- Cached Sensor Information ---
 struct DiscoveredSensor {
     int id = -1;
     std::string label;
@@ -273,7 +466,6 @@ static std::vector<DiscoveredSensor> S_CACHED_SENSORS;
 static std::vector<std::string> S_CACHED_HWMON_DIRS;
 static bool S_CACHE_INITIALIZED = false;
 
-// --- Function: find_hwmon_dirs_for_device  ---
 std::vector<std::string> find_hwmon_dirs_for_device(const std::string& device_name, bool enable_logging) {
     std::vector<std::string> hwmon_paths;
     const std::string hwmon_base_dir = "/sys/class/hwmon/";
@@ -304,14 +496,12 @@ std::vector<std::string> find_hwmon_dirs_for_device(const std::string& device_na
     return hwmon_paths;
 }
 
-// --- Function: clear_cache ---
 void clear_cache() {
     S_CACHED_SENSORS.clear();
     S_CACHED_HWMON_DIRS.clear();
     S_CACHE_INITIALIZED = false;
     ALOGW("Temperature sensor cache has been cleared.");
 }
-
 
 AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
     AllCpuTemperatures all_temps;
@@ -351,23 +541,53 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
 
     if (enable_logging && !read_from_cache_successful) {
         ALOGI("Cache miss or invalidation. Performing full sensor discovery...");
-    } else if (enable_logging && !S_CACHE_INITIALIZED) { // Ensure this condition is met for initial discovery log
+    } else if (enable_logging && !S_CACHE_INITIALIZED) {
         ALOGI("Cache not initialized. Performing initial sensor discovery...");
     }
 
-    S_CACHED_SENSORS.clear(); // Clear before repopulating
+    S_CACHED_SENSORS.clear();
     S_CACHED_HWMON_DIRS.clear();
 
+    // =========================================================================
+    // Try coretemp (Intel), then k10temp (AMD), then zenpower (AMD)
+    // zenpower5 replaces k10temp (same PCI device, cannot coexist), so a
+    // system will have either k10temp OR zenpower, never both.
+    // =========================================================================
+    bool is_amd_sensor = false;
     S_CACHED_HWMON_DIRS = find_hwmon_dirs_for_device("coretemp", enable_logging);
+    if (S_CACHED_HWMON_DIRS.empty()) {
+        S_CACHED_HWMON_DIRS = find_hwmon_dirs_for_device("k10temp", enable_logging);
+        if (S_CACHED_HWMON_DIRS.empty()) {
+            S_CACHED_HWMON_DIRS = find_hwmon_dirs_for_device("zenpower", enable_logging);
+            if (!S_CACHED_HWMON_DIRS.empty()) {
+                is_amd_sensor = true;
+                if (enable_logging) ALOGI("Using AMD zenpower hwmon driver for temperature sensing");
+            }
+        } else {
+            is_amd_sensor = true;
+            if (enable_logging) ALOGI("Using AMD k10temp hwmon driver for temperature sensing");
+        }
+    } else {
+        if (enable_logging) ALOGI("Using Intel coretemp hwmon driver for temperature sensing");
+    }
+
     if (S_CACHED_HWMON_DIRS.empty()){
-        if (enable_logging) ALOGE("No coretemp hwmon directories found via discovery or fallback.");
+        if (enable_logging) ALOGE("No coretemp, k10temp, or zenpower hwmon directories found.");
         S_CACHE_INITIALIZED = false;
         return all_temps;
    }
 
     std::regex temp_file_regex("^temp([0-9]+)_(input|label)$");
+
+    // Intel label patterns
     std::regex core_label_regex("^Core\\s+([0-9]+)$");
     std::regex package_label_regex("^(Package id [0-9]+|Physical id [0-9]+)$");
+
+    // AMD label patterns (k10temp / zenpower)
+    // zenpower5 on multi-CPU systems prefixes labels with "cpuN "
+    // (e.g., "cpu0 Tdie", "cpu1 Tccd1").
+    std::regex amd_ccd_label_regex("^(?:cpu[0-9]+\\s+)?Tccd([0-9]+)$");
+    std::regex amd_die_label_regex("^(?:cpu[0-9]+\\s+)?(Tdie|Tctl)$");
 
     std::map<int, std::string> discovered_labels;
     std::map<int, std::string> discovered_input_paths;
@@ -389,7 +609,6 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
                     auto fc_res_idx = std::from_chars(index_str.data(), index_str.data() + index_str.size(), parsed_index);
 
                     if (fc_res_idx.ec == std::errc() && fc_res_idx.ptr == index_str.data() + index_str.size()) {
-                        // Successfully parsed index
                         std::string type = match[2].str();
                         std::string full_path = hwmon_dir + "/" + filename;
                         if (type == "label") {
@@ -414,7 +633,7 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
         closedir(dir);
     }
 
-    for (auto const& [index_val, label_content] : discovered_labels) { // index_val is used here
+    for (auto const& [index_val, label_content] : discovered_labels) {
         if (discovered_input_paths.count(index_val)) {
             std::string input_path = discovered_input_paths[index_val];
             std::ifstream temp_file(input_path);
@@ -424,7 +643,10 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
                 DiscoveredSensor current_sensor_info;
                 current_sensor_info.label = label_content;
                 current_sensor_info.input_file_path = input_path;
+
                 std::smatch core_match;
+
+                // --- Intel: Core N ---
                 if (std::regex_match(label_content, core_match, core_label_regex)) {
                     std::string core_id_str = core_match[1].str();
                     int parsed_core_id;
@@ -439,6 +661,24 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
                          if (enable_logging) ALOGW("Failed to parse core ID from label '%s' (value '%s'). Error: %d",
                                                   label_content.c_str(), core_id_str.c_str(), static_cast<int>(fc_res_core_id.ec));
                     }
+
+                // --- AMD: TccdN (per-CCD temperature) ---
+                } else if (std::regex_match(label_content, core_match, amd_ccd_label_regex)) {
+                    std::string ccd_id_str = core_match[1].str();
+                    int parsed_ccd_id;
+                    auto fc_res_ccd = std::from_chars(ccd_id_str.data(), ccd_id_str.data() + ccd_id_str.size(), parsed_ccd_id);
+
+                    if (fc_res_ccd.ec == std::errc() && fc_res_ccd.ptr == ccd_id_str.data() + ccd_id_str.size()) {
+                        current_sensor_info.id = parsed_ccd_id;
+                        current_sensor_info.is_package_sensor = false;
+                        all_temps.core_temps.emplace_back(current_sensor_info.id, label_content, temp_celsius);
+                        S_CACHED_SENSORS.push_back(current_sensor_info);
+                        if (enable_logging) ALOGI("Discovered AMD CCD sensor: %s = %.1f°C", label_content.c_str(), temp_celsius);
+                    } else {
+                        if (enable_logging) ALOGW("Failed to parse CCD ID from label '%s'", label_content.c_str());
+                    }
+
+                // --- Intel: Package id N / Physical id N ---
                 } else if (std::regex_match(label_content, package_label_regex)) {
                     current_sensor_info.is_package_sensor = true;
                     if (isnan(all_temps.package_temperature) || temp_celsius > all_temps.package_temperature) {
@@ -446,6 +686,29 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
                         all_temps.package_label = label_content;
                     }
                     S_CACHED_SENSORS.push_back(current_sensor_info);
+
+                // --- AMD: Tdie / Tctl (package-level temperature) ---
+                } else if (std::regex_match(label_content, amd_die_label_regex)) {
+                    current_sensor_info.is_package_sensor = true;
+                    // Prefer Tdie over Tctl: Tdie is the actual die temperature,
+                    // while Tctl may include an artificial offset (Threadripper/EPYC).
+                    bool should_update = false;
+                    if (label_content == "Tdie" || label_content.find("Tdie") != std::string::npos) {
+                        should_update = true;
+                    } else if (all_temps.package_label.find("Tdie") != std::string::npos) {
+                        should_update = false;
+                    } else {
+                        should_update = isnan(all_temps.package_temperature) || temp_celsius > all_temps.package_temperature;
+                    }
+
+                    if (should_update) {
+                        all_temps.package_temperature = temp_celsius;
+                        all_temps.package_label = label_content;
+                    }
+                    S_CACHED_SENSORS.push_back(current_sensor_info);
+                    if (enable_logging) ALOGI("Discovered AMD die sensor: %s = %.1f°C%s",
+                                              label_content.c_str(), temp_celsius,
+                                              should_update ? " (active)" : " (shadowed by Tdie)");
                 }
             } else {
                  if (enable_logging) ALOGW("Failed to read temp from discovered path: %s", input_path.c_str());
@@ -456,7 +719,8 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
 
     if (!S_CACHED_SENSORS.empty()) {
         S_CACHE_INITIALIZED = true;
-        if (enable_logging) ALOGI("Sensor cache populated with %zu entries.", S_CACHED_SENSORS.size());
+        if (enable_logging) ALOGI("Sensor cache populated with %zu entries (%s mode).",
+                                  S_CACHED_SENSORS.size(), is_amd_sensor ? "AMD" : "Intel");
     } else {
         S_CACHE_INITIALIZED = false;
         if (enable_logging) ALOGW("No sensors were successfully discovered to populate cache.");
@@ -470,68 +734,111 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
     return all_temps;
 }
 
+// =============================================================================
+// Thermal Constructor
+// =============================================================================
 Thermal::Thermal() {
+    mNumCpu = get_nprocs();
     mCheckThread = std::thread(&Thermal::CheckThermalServerity, this);
     mCheckThread.detach();
-    mNumCpu = get_nprocs();
 }
+
+// =============================================================================
+// Temperature Monitoring Thread
+// =============================================================================
 void Thermal::CheckThermalServerity() {
     float temp = NAN;
     int res = -1;
     int vsock_fd;
-    bool is_pkg_temp_present = false;
     bool first_iteration_logging_enabled = true;
 
-    kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 99, 108}};
     ALOGI("Start check temp thread.\n");
 
-    if (!connect_vsock(&vsock_fd))
-        is_vsock_present = true;
-    if (access(SYSFS_TEMPERATURE_CPU, F_OK) == 0) {
-        is_pkg_temp_present = true;
-        ALOGI("SOC package temperature is available\n");
+    // --- One-time initialization ---
+    S_CPU_VENDOR = detect_cpu_vendor();
+
+    // Initialize temperature globals
+    {
+        std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+        kTemp_2_0.type = TemperatureType::CPU;
+        kTemp_2_0.name = "TCPU";
+        kTemp_2_0.value = 25;
+        kTemp_2_0.throttlingStatus = ThrottlingSeverity::NONE;
+
+        kTempThreshold.type = TemperatureType::CPU;
+        kTempThreshold.name = "TCPU";
+        kTempThreshold.coldThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, NAN, NAN}};
     }
 
+    initialize_thermal_config();
+
+    // Try VSOCK connection (Celadon VM path)
+    if (!connect_vsock(&vsock_fd))
+        is_vsock_present = true;
+
+    // Discover CPU thermal zone as fallback for hwmon
+    std::string cpu_zone_path = discover_cpu_thermal_zone(true);
+    if (cpu_zone_path.empty()) {
+        const std::string zone0_path = "/sys/class/thermal/thermal_zone0/temp";
+        if (access(zone0_path.c_str(), F_OK) == 0) {
+            cpu_zone_path = zone0_path;
+            ALOGW("Using thermal_zone0 as last-resort fallback (zone type unknown, may not be CPU)");
+        }
+    }
+
+    // --- Main monitoring loop ---
     while (1) {
+        temp = NAN;
+        res = -1;
+
         if (is_vsock_present) {
             res = 0;
             recv_vsock(&vsock_fd);
         } else {
-            if (is_pkg_temp_present) {
-                res = get_soc_pkg_temperature(&temp);
-            } else {
-                // If SOC package temperature is not available, get max core temperature
-                AllCpuTemperatures temps = get_cpu_temperatures(first_iteration_logging_enabled);
-                if (first_iteration_logging_enabled) {
-                    first_iteration_logging_enabled = false; // Disable detailed logging after first successful run
-                }
-                temp = temps.max_core_temp;
-                res = 0;
+            // Primary: hwmon (coretemp on Intel, k10temp/zenpower on AMD)
+            AllCpuTemperatures temps = get_cpu_temperatures(first_iteration_logging_enabled);
+            if (first_iteration_logging_enabled) {
+                first_iteration_logging_enabled = false;
             }
-            kTemp_2_0.value = temp;
+
+            if (!isnan(temps.max_overall_temp)) {
+                temp = temps.max_overall_temp;
+                res = 0;
+            } else if (!cpu_zone_path.empty()) {
+                res = get_soc_pkg_temperature(&temp, cpu_zone_path);
+            }
+
+            if (res == 0 && !isnan(temp)) {
+                std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+                kTemp_2_0.value = temp;
+            }
         }
+
         if (res) {
-            ALOGE("Can not get temperature of type %d", kTemp_1_0.type);
+            ALOGE("Cannot get CPU temperature");
         } else {
-            ALOGI("Size of kTempThreshold.hotThrottlingThresholds=%f, kTemp_2_0.value=%f",kTempThreshold.hotThrottlingThresholds[5], kTemp_2_0.value);
-            for (size_t i = kTempThreshold.hotThrottlingThresholds.size() - 1; i > 0; i--) {
-                if (kTemp_2_0.value >= kTempThreshold.hotThrottlingThresholds[i]) {
-                    kTemp_2_0.type = TemperatureType::CPU;
-                    kTemp_2_0.name = "TCPU";
-                    ALOGI("CheckThermalServerity: hit ThrottlingSeverity %s, temperature is %f",
-                          THROTTLING_SEVERITY_LABEL[i], kTemp_2_0.value);
-                    kTemp_2_0.throttlingStatus = (ThrottlingSeverity)i;
-                    {
-                        std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
-                        for (auto& cb : callbacks_) {
-                            ::ndk::ScopedAStatus ret = cb.callback->notifyThrottling(kTemp_2_0);
-                            if (!ret.isOk()) {
-                                ALOGE("Thermal callback FAILURE");
-                            }
-                            else {
-                                ALOGE("Thermal callback SUCCESS");
-                            }
-                        }
+            // --- Check CPU throttling severity ---
+            // FIX: Reset status each cycle; break at highest matching severity.
+            bool throttled = false;
+            {
+                std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+                kTemp_2_0.throttlingStatus = ThrottlingSeverity::NONE;
+                for (size_t i = kTempThreshold.hotThrottlingThresholds.size() - 1; i > 0; i--) {
+                    if (kTemp_2_0.value >= kTempThreshold.hotThrottlingThresholds[i]) {
+                        ALOGI("CheckThermalServerity: hit ThrottlingSeverity %s, temperature is %f",
+                              THROTTLING_SEVERITY_LABEL[i], kTemp_2_0.value);
+                        kTemp_2_0.throttlingStatus = (ThrottlingSeverity)i;
+                        throttled = true;
+                        break;
+                    }
+                }
+            }
+            if (throttled) {
+                std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
+                for (auto& cb : callbacks_) {
+                    ::ndk::ScopedAStatus ret = cb.callback->notifyThrottling(kTemp_2_0);
+                    if (!ret.isOk()) {
+                        ALOGE("Thermal callback FAILURE");
                     }
                 }
             }
@@ -540,6 +847,9 @@ void Thermal::CheckThermalServerity() {
     }
 }
 
+// =============================================================================
+// AIDL IThermal Methods
+// =============================================================================
 
 ScopedAStatus Thermal::getCoolingDevices(std::vector<CoolingDevice>* out_devices ) {
     LOG(VERBOSE) << __func__;
@@ -570,10 +880,11 @@ ScopedAStatus  Thermal::fillTemperatures(std::vector<Temperature>*  out_temperat
     *out_temperatures = {};
     std::vector<Temperature> ret;
 
-    //CPU temperature
-    kTemp_2_0.type = TemperatureType::CPU;
-    kTemp_2_0.name = "TCPU";
-    ret.emplace_back(kTemp_2_0);
+    // FIX: Read from globals with mutex, don't mutate globals from binder thread.
+    {
+        std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+        ret.emplace_back(kTemp_2_0);
+    }
 
     *out_temperatures = ret;
     return ScopedAStatus::ok();
@@ -586,9 +897,8 @@ ScopedAStatus Thermal::getTemperaturesWithType(TemperatureType in_type,
     *out_temperatures={};
 
     if (in_type == TemperatureType::CPU) {
-        kTemp_2_0.type = TemperatureType::CPU;
-        kTemp_2_0.name = "TCPU";
-
+        // FIX: Read from globals with mutex, don't mutate globals from binder thread.
+        std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
         out_temperatures->emplace_back(kTemp_2_0);
     }
 
@@ -601,11 +911,12 @@ ScopedAStatus Thermal::getTemperatureThresholds(
     *out_temperatureThresholds = {};
     std::vector<TemperatureThreshold> ret;
 
-    kTempThreshold.type = TemperatureType::CPU;
-    kTempThreshold.name = "TCPU";
-    kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 99, 108}};
-    kTempThreshold.coldThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, NAN, NAN}};
-    ret.emplace_back(kTempThreshold);
+    // FIX: Return the dynamically-detected thresholds instead of hardcoding
+    // Intel-specific values every call (which overwrote VSOCK and vendor-detected thresholds).
+    {
+        std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+        ret.emplace_back(kTempThreshold);
+    }
 
     *out_temperatureThresholds = ret;
     return ScopedAStatus::ok();
@@ -619,15 +930,17 @@ ScopedAStatus Thermal::getTemperatureThresholdsWithType(
     *out_temperatureThresholds = {};
 
     if (in_type == TemperatureType::CPU) {
-        kTempThreshold.type = TemperatureType::CPU;
-        kTempThreshold.name = "TCPU";
-        kTempThreshold.hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 99, 108}};
-        kTempThreshold.coldThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, NAN, NAN}};
+        // FIX: Return the dynamically-detected thresholds instead of hardcoding.
+        std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
         out_temperatureThresholds->emplace_back(kTempThreshold);
     }
 
     return ScopedAStatus::ok();
 }
+
+// =============================================================================
+// Callback Registration (fixed: single list, consistent register/unregister)
+// =============================================================================
 
 ScopedAStatus Thermal::registerThermalChangedCallback(
         const std::shared_ptr<IThermalChangedCallback>& in_callback) {
@@ -636,18 +949,8 @@ ScopedAStatus Thermal::registerThermalChangedCallback(
         return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
                                                                 "Invalid nullptr callback");
     }
-    {
-        std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
-        if (std::any_of(thermal_callbacks_.begin(), thermal_callbacks_.end(),
-                        [&](const std::shared_ptr<IThermalChangedCallback>& c) {
-                            return interfacesEqual(c, in_callback);
-                        })) {
-            return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
-                                                                    "Callback already registered");
-        }
-        thermal_callbacks_.push_back(in_callback);
-    }
-
+    // FIX: Use single callbacks_ list consistently. Original code added to both
+    // thermal_callbacks_ and callbacks_, but unregister only removed from thermal_callbacks_.
     std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
     if (std::any_of(callbacks_.begin(), callbacks_.end(), [&](const CallbackSetting &c) {
             return interfacesEqual(c.callback, in_callback);
@@ -655,8 +958,7 @@ ScopedAStatus Thermal::registerThermalChangedCallback(
         return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
                                                                 "Callback already registered");
     }
-    callbacks_.emplace_back(in_callback,false,TemperatureType::UNKNOWN);
-
+    callbacks_.emplace_back(in_callback, false, TemperatureType::UNKNOWN);
 
     return ScopedAStatus::ok();
 }
@@ -669,17 +971,17 @@ ScopedAStatus Thermal::registerThermalChangedCallbackWithType(
         return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
                                                                 "Invalid nullptr callback");
     }
-    {
-        std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
-        if (std::any_of(thermal_callbacks_.begin(), thermal_callbacks_.end(),
-                        [&](const std::shared_ptr<IThermalChangedCallback>& c) {
-                            return interfacesEqual(c, in_callback);
-                        })) {
-            return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
-                                                                    "Callback already registered");
-        }
-        thermal_callbacks_.push_back(in_callback);
+    // FIX: Add to callbacks_ (not just thermal_callbacks_) so the check thread
+    // actually sends throttle notifications for typed callbacks too.
+    std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
+    if (std::any_of(callbacks_.begin(), callbacks_.end(), [&](const CallbackSetting &c) {
+            return interfacesEqual(c.callback, in_callback);
+        })) {
+        return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+                                                                "Callback already registered");
     }
+    callbacks_.emplace_back(in_callback, true, in_type);
+
     return ScopedAStatus::ok();
 }
 
@@ -690,23 +992,23 @@ ScopedAStatus Thermal::unregisterThermalChangedCallback(
         return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
                                                                 "Invalid nullptr callback");
     }
-    {
-        std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
-        bool removed = false;
-        thermal_callbacks_.erase(
-                std::remove_if(thermal_callbacks_.begin(), thermal_callbacks_.end(),
-                               [&](const std::shared_ptr<IThermalChangedCallback>& c) {
-                                   if (interfacesEqual(c, in_callback)) {
-                                       removed = true;
-                                       return true;
-                                   }
-                                   return false;
-                               }),
-                thermal_callbacks_.end());
-        if (!removed) {
-            return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
-                                                                    "Callback wasn't registered");
-        }
+    // FIX: Remove from callbacks_ (the list actually used for notifications).
+    // Original code only removed from thermal_callbacks_ which was never used.
+    std::lock_guard<std::mutex> _lock(thermal_callback_mutex_);
+    bool removed = false;
+    callbacks_.erase(
+            std::remove_if(callbacks_.begin(), callbacks_.end(),
+                           [&](const CallbackSetting& c) {
+                               if (interfacesEqual(c.callback, in_callback)) {
+                                   removed = true;
+                                   return true;
+                               }
+                               return false;
+                           }),
+            callbacks_.end());
+    if (!removed) {
+        return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
+                                                                "Callback wasn't registered");
     }
     return ScopedAStatus::ok();
 }

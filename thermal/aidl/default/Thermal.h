@@ -72,14 +72,15 @@ class Thermal : public BnThermal {
 
     ndk::ScopedAStatus unregisterCoolingDeviceChangedCallback(
             const std::shared_ptr<ICoolingDeviceChangedCallback>& in_callback) override;
+    int getNumCpu(void) { return mNumCpu; }
+
   private:
     std::mutex thermal_callback_mutex_;
-    std::vector<std::shared_ptr<IThermalChangedCallback>> thermal_callbacks_;
     std::thread mCheckThread;
     int mNumCpu;
     std::vector<CallbackSetting> callbacks_;
     std::mutex cdev_callback_mutex_;
-	std::vector<std::shared_ptr<ICoolingDeviceChangedCallback>> cdev_callbacks_;
+    std::vector<std::shared_ptr<ICoolingDeviceChangedCallback>> cdev_callbacks_;
 
 };
 
