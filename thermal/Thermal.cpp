@@ -58,6 +58,36 @@ using ::android::hardware::thermal::V1_0::ThermalStatus;
 using ::android::hardware::thermal::V1_0::ThermalStatusCode;
 
 // =============================================================================
+// DRIVER REGISTRY
+// =============================================================================
+//
+// This table documents all hwmon drivers and thermal zone types currently
+// supported by this HAL. To add a new driver, search for "EXTENSION POINT"
+// markers in this file (numbered #1 through #7) and see DRIVER_INTEGRATION.md.
+//
+// ┌───────────────────┬─────────────────┬──────────────────────────────────────┐
+// │ hwmon name        │ Sensor Type     │ Labels                               │
+// ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+// │ coretemp          │ CPU (Intel)     │ Core N, Package id N, Physical id N  │
+// │ k10temp           │ CPU (AMD)       │ Tdie, Tctl, TccdN                    │
+// │ zenpower          │ CPU (AMD)       │ [cpuN] Tdie, [cpuN] Tctl, TccdN      │
+// ├───────────────────┼─────────────────┼──────────────────────────────────────┤
+// │ (new driver)      │ CPU/GPU/Battery │ (see DRIVER_INTEGRATION.md)          │
+// └───────────────────┴─────────────────┴──────────────────────────────────────┘
+//
+// Thermal zone types (for fallback when hwmon is unavailable):
+//   x86_pkg_temp (Intel), k10temp (AMD), acpitz (generic ACPI)
+//
+// Examples of drivers that could be integrated:
+//   thinkpad_acpi    - ThinkPad thermal sensors, fan control
+//   steamdeck-hwmon  - Steam Deck GPU/APU temperature
+//   oxp-sensors      - OneXPlayer/AOKZOE device sensors
+//   amdgpu           - AMD GPU temperature (edge/junction/mem)
+//   nouveau / i915   - NVIDIA/Intel GPU temperature
+//   power_supply     - Battery temperature (via /sys/class/power_supply/)
+//
+
+// =============================================================================
 // Dynamic CPU Labels (replaces fixed 16-element CPU_LABEL array)
 // =============================================================================
 static std::vector<std::string> S_CPU_LABELS;
@@ -140,6 +170,42 @@ static const Temperature_1_0 kTemp_1_0 = {
         .vrThrottlingThreshold = NAN,
 };
 
+// =============================================================================
+// Temperature & Threshold Variables
+//
+// Each temperature source requires:
+//   1. A Temperature_2_0 variable (holds current value + throttle status)
+//   2. A TemperatureThreshold variable (holds hot/cold threshold arrays)
+//   3. Registration in getCurrentTemperatures() callback
+//   4. Registration in getTemperatureThresholds() callback
+//
+// Currently supported:
+//   - CPU:     kTemp_2_0      + kTempThreshold    (real data from hwmon/thermal zone)
+//   - BATTERY: kTemp_2_0_1    + kTempThreshold_1  (real data from VSOCK or dummy)
+//   - GPU:     kDummyTemp     + kDummyTempThreshold (dummy data for VTS compliance)
+//
+// HOW TO ADD A NEW REAL TEMPERATURE SOURCE (e.g., GPU from amdgpu hwmon):
+//   1. Define a Temperature_2_0 variable:
+//        static Temperature_2_0 kTemp_GPU = {
+//            .type = TemperatureType::GPU,
+//            .name = "TGPU",
+//            .value = 25,
+//            .throttlingStatus = ThrottlingSeverity::NONE,
+//        };
+//   2. Define a TemperatureThreshold:
+//        static TemperatureThreshold kTempThreshold_GPU = {
+//            .type = TemperatureType::GPU,
+//            .name = "TGPU",
+//            .hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 90, 100}},
+//            .coldThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, NAN, NAN}},
+//            .vrThrottlingThreshold = NAN,
+//        };
+//   3. Add reading logic in the CheckThermalServerity thread (see extension
+//      points in that function)
+//   4. Add the variable to getCurrentTemperatures() and
+//      getTemperatureThresholds() callbacks
+//   5. Protect updates with s_temp_data_mutex
+// =============================================================================
 static Temperature_2_0 kTemp_2_0 = {
         .type = TemperatureType::CPU,
         .name = "TCPU",
@@ -177,6 +243,30 @@ static TemperatureThreshold kTempThreshold_1 = {
         .coldThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, NAN, NAN}},
         .vrThrottlingThreshold = NAN,
 };
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ EXTENSION POINT #1: Add Temperature/Threshold globals for new types     │
+// │ See DRIVER_INTEGRATION.md Step 1                                        │
+// │                                                                         │
+// │ For each new sensor type (GPU, Battery, etc.), add:                     │
+// │   - A Temperature_2_0 global to hold the current reading                │
+// │   - A TemperatureThreshold global to hold throttling thresholds         │
+// │                                                                         │
+// │ Example for a real GPU sensor (replacing the dummy):                    │
+// │   static Temperature_2_0 kGpuTemp = {                                  │
+// │       .type = TemperatureType::GPU,                                     │
+// │       .name = "TGPU",                                                   │
+// │       .value = 25,                                                      │
+// │       .throttlingStatus = ThrottlingSeverity::NONE,                     │
+// │   };                                                                    │
+// │   static TemperatureThreshold kGpuTempThreshold = {                    │
+// │       .type = TemperatureType::GPU,                                     │
+// │       .name = "TGPU",                                                   │
+// │       .hotThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, 90, 100}}, │
+// │       .coldThrottlingThresholds = {{NAN, NAN, NAN, NAN, NAN, NAN, NAN}},│
+// │       .vrThrottlingThreshold = NAN,                                     │
+// │   };                                                                    │
+// └──────────────────────────────────────────────────────────────────────────┘
 
 // Workaround for VTS. Dummy entry for GPU threshold.
 static TemperatureThreshold kDummyTempThreshold = {
@@ -229,6 +319,18 @@ static std::string discover_cpu_thermal_zone(bool enable_logging) {
 
     // Priority-ordered list of thermal zone types that reliably indicate CPU temperature.
     // Lower index = higher priority.
+    //
+    // HOW TO ADD A NEW CPU THERMAL ZONE TYPE:
+    //   1. Run on target hardware: cat /sys/class/thermal/thermal_zone*/type
+    //   2. Identify which zone type corresponds to CPU temperature
+    //   3. Add it to this list with an appropriate priority number
+    //      (1 = most specific/accurate, 10+ = generic fallback)
+    //
+    // EXTENSION POINT: Add new entries for other platform-specific CPU
+    // thermal zones. Examples:
+    //   {"thinkpad",     5},    // ThinkPad ACPI thermal zone
+    //   {"cpu-thermal",  3},    // Device-tree based platforms
+    //   {"soc-thermal",  4},    // SoC-level thermal zone
     struct ZoneTypePriority {
         std::string type_name;
         int priority;
@@ -237,6 +339,8 @@ static std::string discover_cpu_thermal_zone(bool enable_logging) {
         {"x86_pkg_temp", 1},    // Intel package temperature (most specific, most accurate)
         {"k10temp",      2},    // AMD k10temp (if exposed as thermal zone)
         {"acpitz",       10},   // ACPI thermal zone (generic, often inaccurate but better than nothing)
+        // EXTENSION POINT #2: Add new thermal zone types here (see DRIVER_INTEGRATION.md Step 2a)
+        // Example: {"thinkpad", 3},  // ThinkPad ACPI thermal zone
     };
 
     std::string best_path;
@@ -303,9 +407,16 @@ static float read_critical_trip_from_zones() {
         std::getline(type_file, zone_type);
         type_file.close();
 
-        // Only examine CPU-related zones for critical trip points
+        // Only examine CPU-related zones for critical trip points.
+        // EXTENSION POINT: Add thermal zone type strings for new CPU drivers.
         if (zone_type != "x86_pkg_temp" && zone_type != "acpitz" &&
             zone_type != "k10temp" && zone_type != "coretemp" &&
+            /* EXTENSION POINT: Add new CPU zone types here.
+             * Examples:
+             *   zone_type != "thinkpad" &&
+             *   zone_type != "cpu-thermal" &&
+             *   zone_type != "soc-thermal" &&
+             */
             zone_type.find("cpu") == std::string::npos &&
             zone_type.find("CPU") == std::string::npos) {
             continue;
@@ -556,9 +667,30 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
     S_CACHED_HWMON_DIRS.clear();
 
     // =========================================================================
-    // FIX: Try coretemp (Intel), then k10temp (AMD), then zenpower (AMD)
-    // zenpower5 replaces k10temp (same PCI device, cannot coexist), so a
-    // system will have either k10temp OR zenpower, never both.
+    // hwmon Driver Discovery Chain
+    //
+    // This chain determines which hwmon driver to use for CPU temperature.
+    // Only one driver will be active (first match wins).
+    //
+    // Current chain: coretemp (Intel) → k10temp (AMD) → zenpower (AMD OOT)
+    //
+    // HOW TO ADD A NEW CPU hwmon DRIVER:
+    //   1. Find the driver's hwmon name on target hardware:
+    //        cat /sys/class/hwmon/hwmon*/name
+    //   2. Check what temp labels it exposes:
+    //        cat /sys/class/hwmon/hwmon*/temp*_label
+    //   3. Add a new find_hwmon_dirs_for_device() call in this chain
+    //   4. If the driver uses non-standard labels (not "Core N" or
+    //      "Tdie"/"Tctl"/"TccdN"), add new regex patterns below
+    //      (see "Label Pattern Extension" section)
+    //
+    // FUTURE: To add GPU or Battery hwmon support, create separate
+    // discovery functions (e.g., get_gpu_temperatures()) following
+    // this same pattern. Candidate drivers:
+    //   GPU:     "amdgpu", "nouveau", "nvidia", "i915"
+    //   Battery: "bq24190_charger", "max17042_battery"
+    //   Other:   "thinkpad" (thinkpad_acpi), "steamdeck_hwmon",
+    //            "oxpec" (oxp-sensors)
     // =========================================================================
     bool is_amd_sensor = false;
     S_CACHED_HWMON_DIRS = find_hwmon_dirs_for_device("coretemp", enable_logging);
@@ -573,6 +705,12 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
                 is_amd_sensor = true;
                 if (enable_logging) ALOGI("Using AMD zenpower hwmon driver for temperature sensing");
             }
+            // EXTENSION POINT #3: Add more CPU hwmon driver names here
+            // See DRIVER_INTEGRATION.md Step 2b
+            // Example:
+            // if (S_CACHED_HWMON_DIRS.empty()) {
+            //     S_CACHED_HWMON_DIRS = find_hwmon_dirs_for_device("thinkpad", enable_logging);
+            // }
         } else {
             is_amd_sensor = true;
             if (enable_logging) ALOGI("Using AMD k10temp hwmon driver for temperature sensing");
@@ -589,6 +727,34 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
 
     std::regex temp_file_regex("^temp([0-9]+)_(input|label)$");
 
+    // =========================================================================
+    // Label Pattern Extension
+    //
+    // Each hwmon driver uses different label strings. The regex patterns below
+    // determine how sensor labels are classified (core vs. package).
+    //
+    // HOW TO ADD LABEL PATTERNS FOR A NEW DRIVER:
+    //   1. Read all labels: cat /sys/class/hwmon/hwmonN/temp*_label
+    //   2. Identify which labels are per-core and which are package-level
+    //   3. Add new regex patterns below
+    //   4. Add matching else-if blocks in the label classification loop
+    //      (around line 664 onwards)
+    //
+    // Example: thinkpad_acpi might expose:
+    //   temp1_label = "CPU"         → package sensor
+    //   temp2_label = "GPU"         → GPU sensor (would need new handler)
+    //   temp3_label = "Battery"     → battery sensor
+    //
+    // Example: steamdeck_hwmon might expose:
+    //   temp1_label = "SoC"         → package sensor (APU temperature)
+    //   temp2_label = "Battery"     → battery sensor
+    //
+    // EXTENSION POINT: Add new regex patterns for new drivers here.
+    // static std::regex thinkpad_cpu_regex("^CPU$");
+    // static std::regex thinkpad_gpu_regex("^GPU$");
+    // static std::regex steamdeck_soc_regex("^SoC$");
+    // =========================================================================
+
     // Intel label patterns
     std::regex core_label_regex("^Core\\s+([0-9]+)$");
     std::regex package_label_regex("^(Package id [0-9]+|Physical id [0-9]+)$");
@@ -603,6 +769,18 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
     // (?:cpu[0-9]+\s+)? group handles both formats transparently.
     std::regex amd_ccd_label_regex("^(?:cpu[0-9]+\\s+)?Tccd([0-9]+)$");
     std::regex amd_die_label_regex("^(?:cpu[0-9]+\\s+)?(Tdie|Tctl)$");
+
+    // ┌──────────────────────────────────────────────────────────────────────┐
+    // │ EXTENSION POINT #4: Add label regex patterns for new drivers         │
+    // │ See DRIVER_INTEGRATION.md Step 3                                     │
+    // │                                                                      │
+    // │ To find your labels: cat /sys/class/hwmon/hwmon*/temp*_label          │
+    // │                                                                      │
+    // │ Examples:                                                            │
+    // │   // thinkpad_acpi: std::regex thinkpad_cpu_regex("^CPU$");          │
+    // │   // amdgpu: std::regex amdgpu_edge_regex("^edge$");                │
+    // │   // steamdeck-hwmon: std::regex steamdeck_regex("^(CPU|APU)$");     │
+    // └──────────────────────────────────────────────────────────────────────┘
 
     std::map<int, std::string> discovered_labels;
     std::map<int, std::string> discovered_input_paths;
@@ -728,6 +906,19 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
                                               label_content.c_str(), temp_celsius,
                                               should_update ? " (active)" : " (shadowed by Tdie)");
                 }
+                // ┌──────────────────────────────────────────────────────────┐
+                // │ EXTENSION POINT #5: Match new driver labels here         │
+                // │ See DRIVER_INTEGRATION.md Step 4                         │
+                // │                                                          │
+                // │ Add else-if branches for your driver's label patterns.   │
+                // │ For GPU/Battery, update separate globals under mutex.    │
+                // │                                                          │
+                // │ Example:                                                 │
+                // │ } else if (std::regex_match(label, gpu_regex)) {         │
+                // │     std::lock_guard<std::mutex> _l(s_temp_data_mutex);    │
+                // │     kGpuTemp.value = temp_celsius;                        │
+                // │ }                                                         │
+                // └──────────────────────────────────────────────────────────┘
             } else {
                  if (enable_logging) ALOGW("Failed to read temp from discovered path: %s", input_path.c_str());
             }
@@ -751,6 +942,66 @@ AllCpuTemperatures get_cpu_temperatures(bool enable_logging = true) {
     all_temps.update_max_temps();
     return all_temps;
 }
+
+// =============================================================================
+// EXTENSION POINT #6: Non-CPU Sensor Discovery Functions
+// =============================================================================
+//
+// To add GPU, Battery, or other non-CPU hwmon sensor support, create
+// dedicated discovery functions following the get_cpu_temperatures() pattern.
+//
+// Each function should:
+//   1. Use find_hwmon_dirs_for_device("driver_name") to locate hwmon dirs
+//   2. Read temp*_input files for temperature values
+//   3. Update the corresponding global (e.g., kGpuTemp) under s_temp_data_mutex
+//   4. Be called from CheckThermalServerity() in the monitoring loop
+//
+// Example skeleton for GPU temperature:
+//
+// static float get_gpu_temperature(bool enable_logging = true) {
+//     static std::vector<std::string> gpu_hwmon_dirs;
+//     static bool gpu_discovered = false;
+//
+//     if (!gpu_discovered) {
+//         // Try AMD GPU first, then Intel, then NVIDIA
+//         gpu_hwmon_dirs = find_hwmon_dirs_for_device("amdgpu", enable_logging);
+//         if (gpu_hwmon_dirs.empty())
+//             gpu_hwmon_dirs = find_hwmon_dirs_for_device("i915", enable_logging);
+//         if (gpu_hwmon_dirs.empty())
+//             gpu_hwmon_dirs = find_hwmon_dirs_for_device("nouveau", enable_logging);
+//         gpu_discovered = true;
+//     }
+//
+//     if (gpu_hwmon_dirs.empty()) return NAN;
+//
+//     // Read temp1_input (most GPU drivers use this for edge/junction temp)
+//     std::string path = gpu_hwmon_dirs[0] + "/temp1_input";
+//     std::ifstream file(path);
+//     float raw;
+//     if (file.is_open() && (file >> raw)) {
+//         return raw / 1000.0f;
+//     }
+//     return NAN;
+// }
+//
+// Example skeleton for Battery temperature:
+//
+// static float get_battery_temperature(bool enable_logging = true) {
+//     // Battery temp is typically at /sys/class/power_supply/BAT0/temp
+//     const char* paths[] = {
+//         "/sys/class/power_supply/BAT0/temp",
+//         "/sys/class/power_supply/BAT1/temp",
+//         "/sys/class/power_supply/battery/temp",
+//     };
+//     for (const char* path : paths) {
+//         std::ifstream file(path);
+//         float raw;
+//         if (file.is_open() && (file >> raw)) {
+//             return raw / 10.0f;  // power_supply uses 0.1°C units
+//         }
+//     }
+//     return NAN;
+// }
 
 // =============================================================================
 // CPU Usage (dynamic labels)
@@ -1156,6 +1407,12 @@ Return<void> Thermal::getCurrentTemperatures(bool filterType, TemperatureType ty
         // (coretemp, k10temp, thermal zones) and is thread-safe.
         if (filterType && type != kTemp_2_0.type) {
             // Not CPU type — fall through to VTS workaround below
+            // EXTENSION POINT #7a: Add filter matches for new sensor types
+            // Example:
+            // if (type == kGpuTemp.type) {
+            //     std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
+            //     temperatures = {kGpuTemp};
+            // }
         } else {
             std::lock_guard<std::mutex> _lock(s_temp_data_mutex);
             temperatures = {kTemp_2_0};
@@ -1168,6 +1425,10 @@ Return<void> Thermal::getCurrentTemperatures(bool filterType, TemperatureType ty
             // GPU temp is not exposed in Intel Android platforms.
             // So add the dummy entry for GPU temp.
             temperatures = {kTemp_2_0, kDummyTemp, kTemp_2_0_1};
+            // EXTENSION POINT #7b: When adding real GPU/Battery sensors,
+            // replace kDummyTemp with the real global (e.g., kGpuTemp)
+            // and add any additional sensor types to this vector:
+            //   temperatures = {kTemp_2_0, kGpuTemp, kTemp_2_0_1};
             for (size_t i = kTempThreshold.hotThrottlingThresholds.size() - 1; i > 0; i--) {
                 if (temperatures[0].value >= kTempThreshold.hotThrottlingThresholds[i]) {
                     temperatures[0].throttlingStatus = (ThrottlingSeverity)i;
@@ -1199,6 +1460,11 @@ Return<void> Thermal::getCurrentTemperatures(bool filterType, TemperatureType ty
                 }
             }
         }
+        // EXTENSION POINT #7c: Add else-if for new sensor types in VSOCK path
+        // Example:
+        // else if (type == kGpuTemp.type) {
+        //     temperatures = {kGpuTemp};
+        // }
     }
 
     // Workaround for VTS Test
@@ -1226,6 +1492,10 @@ Return<void> Thermal::getTemperatureThresholds(bool filterType, TemperatureType 
     if (!is_vsock_present) {
         if (filterType && type != kTempThreshold.type) {
             // Workaround for VTS test
+            // EXTENSION POINT #7d: Add threshold filter matches for new types
+            // Example:
+            // if (type == kGpuTempThreshold.type)
+            //     temperature_thresholds = {kGpuTempThreshold};
         } else {
             temperature_thresholds = {kTempThreshold};
         }
@@ -1234,8 +1504,14 @@ Return<void> Thermal::getTemperatureThresholds(bool filterType, TemperatureType 
             temperature_thresholds = {kTempThreshold};
         else if (type == kTempThreshold_1.type)
             temperature_thresholds = {kTempThreshold_1};
+        // EXTENSION POINT #7e: Add threshold filter for new sensor types
+        // Example:
+        // else if (type == kGpuTempThreshold.type)
+        //     temperature_thresholds = {kGpuTempThreshold};
     } else {
         temperature_thresholds = {kTempThreshold, kDummyTempThreshold, kTempThreshold_1};
+        // EXTENSION POINT #7f: Replace kDummyTempThreshold with real GPU thresholds
+        // and add any new sensor type thresholds to this vector.
     }
 
     //Workaround for VTS.
